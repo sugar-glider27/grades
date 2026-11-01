@@ -9,7 +9,7 @@ def normalize_login(value):
 
 
 def process_redemption(hw, canvas_csv, original_csv, redemption_csv,
-                       output_csv=None, redemption_credit=0.8):
+                       checkpoint_csv=None, output_csv=None, redemption_credit=0.8):
     
     canvas_csv = Path(canvas_csv)
     original_csv = Path(original_csv)
@@ -23,13 +23,22 @@ def process_redemption(hw, canvas_csv, original_csv, redemption_csv,
         if not path.exists():
             raise FileNotFoundError(path)
 
+    if checkpoint_csv is not None:
+        checkpoint_csv = Path(checkpoint_csv)
+        if not checkpoint_csv.exists():
+            raise FileNotFoundError(checkpoint_csv)
+
+
     canvas = pd.read_csv(canvas_csv)
     original = pd.read_csv(original_csv)
+    checkpoint = pd.read_csv(checkpoint_csv) if checkpoint_csv is not None else None
     redemption = pd.read_csv(redemption_csv)
 
     canvas["_login"] = canvas["SIS Login ID"].map(normalize_login)
     original["_login"] = original["Email"].map(normalize_login)
     redemption["_login"] = redemption["Email"].map(normalize_login)
+    if checkpoint is not None:
+        checkpoint["_login"] = checkpoint["Email"].map(normalize_login)
 
     hw_columns = [
         col for col in canvas.columns
@@ -52,6 +61,17 @@ def process_redemption(hw, canvas_csv, original_csv, redemption_csv,
             f"Max scores differ: original={original_max[0]}, "
             f"redemption={redemption_max[0]}"
         )
+
+    checkpoint_max = 0
+    if checkpoint is not None:
+        checkpoint_max_values = checkpoint["Max Points"].dropna().unique()
+
+        if len(checkpoint_max_values) != 1:
+            raise ValueError(
+                f"Could not determine a unique checkpoint max score: "
+                f"{checkpoint_max_values}"
+            )
+        checkpoint_max = checkpoint_max_values[0]
 
     orig = original[
         ["_login", "First Name", "Last Name", "Email", "Total Score"]
@@ -94,8 +114,42 @@ def process_redemption(hw, canvas_csv, original_csv, redemption_csv,
         "original_score", "redemption_score"
     ]].copy()
 
+    if checkpoint is not None:
+        checkpoint = checkpoint.rename(columns={
+            "First Name": "first_name_checkpoint",
+            "Last Name": "last_name_checkpoint",
+            "Email": "email_checkpoint",
+            "Total Score": "checkpoint_score",
+        })
+
+        grades = grades.merge(
+            checkpoint[[
+                "_login", "first_name_checkpoint", "last_name_checkpoint",
+                "email_checkpoint", "checkpoint_score"
+            ]],
+            on="_login",
+            how="outer",
+            validate="one_to_one",
+        )
+
+        for col in ["first_name", "last_name", "email"]:
+            grades[col] = grades[col].fillna(grades[f"{col}_checkpoint"])
+
+        grades = grades.drop(columns=[
+            "first_name_checkpoint",
+            "last_name_checkpoint",
+            "email_checkpoint",
+        ])
+    else:
+        grades["checkpoint_score"] = float("nan")
+
     # No original submission => 0 points as an original score
     grades["original_score"] = grades["original_score"].fillna(0)
+
+    if not grades["checkpoint_score"].dropna().between(0, checkpoint_max).all():
+        raise ValueError(
+            f"Checkpoint scores must be between 0 and {checkpoint_max}."
+        )
 
     grades["used_redemption"] = (
         grades["redemption_score"].notna()
@@ -107,19 +161,28 @@ def process_redemption(hw, canvas_csv, original_csv, redemption_csv,
     ).clip(lower=0).fillna(0)
 
     grades["final_score"] = (
-        grades["original_score"] + redemption_credit * improvement
+        grades["original_score"] 
+        + redemption_credit * improvement
+        + grades["checkpoint_score"].fillna(0)
     ).round(2)
 
     submitted_redemption = grades.loc[
         grades["redemption_score"].notna(),
         ["first_name", "last_name", "original_score",
-         "redemption_score", "final_score"],
+         "redemption_score", "checkpoint_score", "final_score"],
     ].copy()
+
+    submitted_checkpoint = grades.loc[
+        grades["checkpoint_score"].notna(),
+        ["first_name", "last_name", "original_score",
+         "redemption_score", "checkpoint_score", "final_score"],
+    ].copy()
+
 
     unmatched = grades.loc[
         ~grades["_login"].isin(canvas["_login"]),
         ["first_name", "last_name", "email", "original_score",
-         "redemption_score", "final_score"],
+         "redemption_score", "checkpoint_score", "final_score"],
     ].copy()
 
     score_map = grades.set_index("_login")["final_score"]
@@ -137,7 +200,10 @@ def process_redemption(hw, canvas_csv, original_csv, redemption_csv,
         "hw_col": hw_col,
         "max_points": original_max[0],
         "grades": grades,
+        "checkpoint": checkpoint,
+        "checkpoint_max_points": checkpoint_max,
         "submitted_redemption": submitted_redemption,
+        "submitted_checkpoint": submitted_checkpoint,
         "unmatched": unmatched,
         "canvas_preview": canvas_preview,
         "output_csv": output_csv,
